@@ -551,7 +551,7 @@ def build_user_manage_keyboard(user_data, page=0):
 
     addition_btn = InlineKeyboardButton(f"📤 Добавление: {'✅' if user_data.get('addition', True) else '❌️'}",callback_data=f"user_toggle_addition:{user_data['id']}")
     download_btn = InlineKeyboardButton(f"📥 Получение: {'✅' if user_data.get('download', True) else '❌️'}",callback_data=f"user_toggle_download:{user_data['id']}")
-    rename_btn = InlineKeyboardButton(f"✏️ Смена имени: {'✅️' if user_data.get('rename', True) else '❌️'}",callback_data=f"user_toggle_rename:{user_data['id']}")
+    rename_btn = InlineKeyboardButton(f"✏️ Смена имен: {'✅️' if user_data.get('rename', True) else '❌️'}",callback_data=f"user_toggle_rename:{user_data['id']}")
     delete_btn = InlineKeyboardButton(f"🗑 Удаление: {'✅️' if user_data.get('delete', True) else '❌️'}",callback_data=f"user_toggle_delete:{user_data['id']}")
     folders_limit_val = user_data.get('folders_limit', 10)
     folders_limit_caption = "Нет" if folders_limit_val == 0 else str(folders_limit_val)
@@ -615,8 +615,69 @@ def get_main_kb(user_id):
     ]
     if get_status(user_id) == "admin":
         buttons.append([KeyboardButton("⚙️ Управление пользователями")])
-    buttons.append([KeyboardButton("🚪 Выйти из аккаунта")])
+    buttons.append([KeyboardButton("👁 Мой аккаунт")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+# Текст для меню профиля пользователя.
+def build_my_account_text(user_data):
+    status = user_data.get("status", "default")
+    if status == "admin":
+        status_str = "👑 Статус: Администратор"
+    elif status == "banned":
+        status_str = "🚫 Статус: Заблокирован"
+    else:
+        status_str = "👶 Статус: Пользователь"
+    created_at = user_data.get("created_at")
+    if created_at:
+        try:
+            dt = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+            created_str = dt.strftime("%d.%m.%y")
+        except Exception:
+            created_str = "---"
+    else:
+        created_str = "---"
+    username = escape_md(str(user_data.get("username", "")))
+    folders_count = escape_md(str(user_data.get("folders", 0)))
+    folders_limit = user_data.get("folders_limit", 10)
+    folders_limit_str = "♾️" if folders_limit == 0 else str(folders_limit)
+    user_id = escape_md(str(user_data.get('id')))
+    created_str = escape_md(created_str)
+    return (
+        f"*👁 Данные о вашем аккаунте*\n\n"
+        f"```Информация\n"
+        f"{status_str}\n"
+        f"🆔 Ваш ID: {user_id}\n"
+        f"📛 Имя в базе: {username}\n"
+        f"🗓 Дата добавления: {created_str}\n"
+        f"🗂 Всего папок: {folders_count} из {folders_limit_str}```\n\n"
+        f"*🔎 Разрешения, установленные администратором:*"
+    )
+
+# Клавиатура для меню профиля пользователя.
+def build_my_account_keyboard(user_data):
+    addition_btn = InlineKeyboardButton(f"📤 Добавление: {'✅' if user_data.get('addition', True) else '❌️'}", callback_data="noop")
+    download_btn = InlineKeyboardButton(f"📥 Получение: {'✅' if user_data.get('download', True) else '❌️'}", callback_data="noop")
+    rename_btn = InlineKeyboardButton(f"✏️ Смена имен: {'✅️' if user_data.get('rename', True) else '❌️'}", callback_data="noop")
+    delete_btn = InlineKeyboardButton(f"🗑 Удаление: {'✅️' if user_data.get('delete', True) else '❌️'}", callback_data="noop")
+    folders_limit_val = user_data.get('folders_limit', 10)
+    folders_limit_caption = "Нет" if folders_limit_val == 0 else str(folders_limit_val)
+    folders_limit_btn = InlineKeyboardButton(f"📁 Лимит на создание папок: {folders_limit_caption}", callback_data="noop")
+    logout_btn = InlineKeyboardButton("🚪 Выйти из аккаунта", callback_data="my_account_logout_confirm")
+    return InlineKeyboardMarkup([
+        [addition_btn, download_btn],
+        [rename_btn, delete_btn],
+        [folders_limit_btn],
+        [logout_btn]
+    ])
+
+# Клавиатура подтверждения выхода из аккаунта.
+def build_logout_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚪 Выйти", callback_data="my_account_logout"),
+            InlineKeyboardButton("🔙 Отмена", callback_data="my_account_logout_cancel"),
+        ]
+    ])
 
 # Клавиатура с кнопкой отмены.
 def get_cancel_kb():
@@ -806,7 +867,7 @@ async def precheck_reply(update, context):
         await update.message.reply_text("Войдите через кнопку ниже.", reply_markup=get_guest_kb())
         return True
     if is_banned(user_id):
-        await update.message.reply_text("🚫 Функционал бота временно недоступен для вас.", reply_markup=get_guest_kb())
+        await update.message.reply_text("🚫 Функционал бота недоступен из-за блокировки.", reply_markup=get_guest_kb())
         return True
     return False
 
@@ -848,7 +909,7 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❓ Вас нет в базе данных пользователей. Доступ ограничен.", reply_markup=get_guest_kb())
         return ConversationHandler.END
     if is_banned(user_id):
-        await update.message.reply_text("🚫 Функционал бота временно недоступен для вас.", reply_markup=get_guest_kb())
+        await update.message.reply_text("🚫 Функционал бота недоступен из-за блокировки.", reply_markup=get_guest_kb())
         return ConversationHandler.END
     password = update.message.text
     if check_password(user_id, password):
@@ -867,7 +928,7 @@ async def guest_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❓ Вас нет в базе данных пользователей. Доступ ограничен.", reply_markup=get_guest_kb())
         return ConversationHandler.END
     if is_banned(user_id):
-        await update.message.reply_text("🚫 Функционал бота временно недоступен для вас.", reply_markup=get_guest_kb())
+        await update.message.reply_text("🚫 Функционал бота недоступен из-за блокировки.", reply_markup=get_guest_kb())
         return ConversationHandler.END
     user = get_user(user_id)
     if user.get("authorized", False):
@@ -926,9 +987,9 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         return await admin_users_menu(update, context)
 
-    elif text == "🚪 Выйти из аккаунта":
-        set_authorized(user_id, False)
-        await update.message.reply_text("Вы вышли из аккаунта.", reply_markup=get_guest_kb())
+    elif text == "👁 Мой аккаунт":
+        user = get_user(user_id)
+        await update.message.reply_text(build_my_account_text(user),parse_mode="Markdown",reply_markup=build_my_account_keyboard(user))
         return ConversationHandler.END
 
 # Создание новой папки.
@@ -1463,7 +1524,7 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Войдите через кнопку ниже.", reply_markup=get_guest_kb())
         return ConversationHandler.END
     if is_banned(user_id):
-        await update.message.reply_text("🚫 Функционал бота временно недоступен для вас.", reply_markup=get_guest_kb())
+        await update.message.reply_text("🚫 Функционал бота недоступен из-за блокировки.", reply_markup=get_guest_kb())
         return ConversationHandler.END
 
     log_state(update, context, "add_files")
@@ -1593,7 +1654,7 @@ async def rename_folder_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Войдите через кнопку ниже.", reply_markup=get_guest_kb())
         return ConversationHandler.END
     if is_banned(user_id):
-        await update.message.reply_text("🚫 Функционал бота временно недоступен для вас.", reply_markup=get_guest_kb())
+        await update.message.reply_text("🚫 Функционал бота недоступен из-за блокировки.", reply_markup=get_guest_kb())
         return ConversationHandler.END
 
     log_state(update, context, "rename_folder_name")
@@ -1663,7 +1724,7 @@ async def rename_file_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Войдите через кнопку ниже.", reply_markup=get_guest_kb())
         return ConversationHandler.END
     if is_banned(user_id):
-        await update.message.reply_text("🚫 Функционал бота временно недоступен для вас.", reply_markup=get_guest_kb())
+        await update.message.reply_text("🚫 Функционал бота недоступен из-за блокировки.", reply_markup=get_guest_kb())
         return ConversationHandler.END
 
     log_state(update, context, "rename_file_name")
@@ -1752,6 +1813,35 @@ async def rename_file_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка переименования файла: {escape_md(str(e))}", reply_markup=get_cancel_kb())
         return ConversationStates.FILE_RENAME
+
+# Обработчик Inline-кнопок профиля пользователя
+async def my_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "my_account_logout_confirm":
+        await query.edit_message_text("Вы действительно хотите *завершить* сессию?",parse_mode="Markdown",reply_markup=build_logout_confirm_keyboard())
+        return ConversationHandler.END
+
+    elif data == "my_account_logout":
+        set_authorized(user_id, False)
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.message.chat.send_message("Вы вышли из аккаунта. Войдите через кнопку ниже.", reply_markup=get_guest_kb())
+        return ConversationHandler.END
+
+    elif data == "my_account_logout_cancel":
+        user = get_user(user_id)
+        await query.edit_message_text(build_my_account_text(user),parse_mode="Markdown",reply_markup=build_my_account_keyboard(user))
+        return ConversationHandler.END
+
+    elif data == "noop":
+        await query.answer(" ", show_alert=False)
+        return ConversationHandler.END
 
 # Меню управления пользователями для администратора.
 async def admin_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2237,7 +2327,7 @@ async def ignore_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if LOG_ENABLED:
         log("Bot starting...")
-    
+
     if not check_mongodb_connection():
         log("Ошибка подключения к MongoDB. Бот не может быть запущен.")
         return
@@ -2246,7 +2336,7 @@ def main():
 
     main_conv = ConversationHandler(
         entry_points=[MessageHandler(
-            filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|🚪 Выйти из аккаунта)$"),
+            filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|👁 Мой аккаунт)$"),
             main_menu
         )],
         states={
@@ -2282,30 +2372,30 @@ def main():
             ],
             ConversationStates.USER_MANAGE_MENU: [
                 CallbackQueryHandler(user_admin_callback, pattern=r".*"),
-                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|🚪 Выйти из аккаунта)$"), main_menu),
+                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|👁 Мой аккаунт)$"), main_menu),
                 MessageHandler(filters.ALL, unknown)
             ],
             ConversationStates.USER_MANAGE_USER: [
                 CallbackQueryHandler(user_admin_callback, pattern=r".*"),
-                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|🚪 Выйти из аккаунта)$"), main_menu),
+                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|👁 Мой аккаунт)$"), main_menu),
                 MessageHandler(filters.ALL, unknown)
             ],
             ConversationStates.USER_ADD_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, user_add_id),
                 CallbackQueryHandler(user_admin_callback, pattern=r".*"),
-                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|🚪 Выйти из аккаунта)$"), main_menu),
+                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|👁 Мой аккаунт)$"), main_menu),
                 MessageHandler(filters.ALL, unknown)
             ],
             ConversationStates.USER_ADD_PASS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, user_add_pass),
                 CallbackQueryHandler(user_admin_callback, pattern=r".*"),
-                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|🚪 Выйти из аккаунта)$"), main_menu),
+                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|👁 Мой аккаунт)$"), main_menu),
                 MessageHandler(filters.ALL, unknown)
             ],
             ConversationStates.USER_ADD_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, user_add_name),
                 CallbackQueryHandler(user_admin_callback, pattern=r".*"),
-                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|🚪 Выйти из аккаунта)$"), main_menu),
+                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|👁 Мой аккаунт)$"), main_menu),
                 MessageHandler(filters.ALL, unknown)
             ],
             ConversationStates.USER_SEND_MSG: [
@@ -2321,7 +2411,7 @@ def main():
             ConversationStates.USER_SET_LIMIT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, user_set_limit),
                 CallbackQueryHandler(user_admin_callback, pattern=r".*"),
-                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|🚪 Выйти из аккаунта)$"), main_menu),
+                MessageHandler(filters.Regex("^(➕ Создать папку|🗂 Список папок|⚙️ Управление пользователями|👁 Мой аккаунт)$"), main_menu),
                 MessageHandler(filters.ALL, unknown)
             ],
             ConversationStates.USER_DELETE_CONFIRM: [
@@ -2348,6 +2438,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(guest_conv)
     app.add_handler(main_conv)
+    app.add_handler(CallbackQueryHandler(
+        my_account_callback,
+        pattern=r"^(my_account_logout|noop|my_account_logout_confirm|my_account_logout_cancel)$"
+    ))
     app.add_handler(MessageHandler(filters.ALL, unknown))
 
     if LOG_ENABLED:
