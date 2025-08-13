@@ -219,7 +219,11 @@ def sync_files_in_folder(folder):
         return folder
     fs_files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
     files_meta = folder.get("files", [])
-    files_meta = [f for f in files_meta if f["name"] in fs_files]
+    unique_files = {}
+    for f in files_meta:
+        if f["name"] in fs_files and f["name"] not in unique_files:
+            unique_files[f["name"]] = f
+    files_meta = list(unique_files.values())
     fs_names_set = set(f["name"] for f in files_meta)
     for fname in fs_files:
         if fname not in fs_names_set:
@@ -1549,8 +1553,14 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_size = os.path.getsize(save_path)
             added_files.append((file_name, file_size))
             processed_file_names.add(file_name)
-            folder["files"].append({"id": str(uuid.uuid4()), "name": file_name})
-            save_folders(load_folders())
+
+            folders = load_folders()
+            for f in folders:
+                if f["id"] == folder_id:
+                    f["files"].append({"id": str(uuid.uuid4()), "name": file_name})
+                    break
+            save_folders(folders)
+
         except telegram.error.BadRequest as e:
             if "File is too big" in str(e):
                 too_big_files.append(file_name)
@@ -1559,6 +1569,7 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if added_files:
         context.user_data["add_files"]["added"] = True
+        folder = get_folder_by_id(folder_id)
     show_finish = context.user_data["add_files"].get("added", False)
 
     reply_messages = []
