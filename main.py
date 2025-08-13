@@ -826,7 +826,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Доступно Local Bot API\n\n"
         "*3️⃣ Ссылки:*\n"
         "💭 Автор проекта: [ibuzy](https://t.me/ibuzy)\n"
-        "🔗 GitHub репозиторий: [Kol-Dayn](https://github.com/Kol-Dayn)\n\n"
+        "🔗 GitHub репозиторий: [Kol-Dayn](https://github.com/Kol-Dayn/Database)\n\n"
         "`Этот проект распространяется на условиях лицензии Apache-2.0 license`\n\n"
         "*➡️ Для входа — воспользуйтесь кнопкой в меню*"
     )
