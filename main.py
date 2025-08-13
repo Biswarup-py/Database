@@ -10,6 +10,9 @@ import warnings
 from enum import Enum, auto
 import urllib.parse
 from dotenv import load_dotenv
+import pymongo
+from pymongo import MongoClient
+from bson import ObjectId
 from telegram.request import HTTPXRequest
 from telegram import (
     Update, ReplyKeyboardMarkup, InlineKeyboardMarkup,
@@ -22,7 +25,7 @@ from telegram.ext import (
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-LOG_ENABLED = True  # Logging
+LOG_ENABLED = True  # Логирование (True/False)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE_DIR = os.path.join(BASE_DIR, "Database")
 FOLDERS_FILE = os.path.join(BASE_DIR, "folders.json")
@@ -35,8 +38,22 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BOT_API_MODE = os.getenv("TELEGRAM_BOT_API_MODE", "cloud").lower()
 BOT_API_URL = os.getenv("TELEGRAM_BOT_API_URL")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+DB_NAME = os.getenv("DB_NAME", "telegram_bot")
 
-if BOT_API_MODE == "local":
+try:
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    users_collection = db['users']
+    folders_collection = db['folders']
+    
+    users_collection.create_index("id", unique=True)
+    folders_collection.create_index("name", unique=True)
+except Exception as e:
+    print(f"Ошибка подключения к MongoDB: {e}")
+    sys.exit(1)
+
+if BOT_API_MODE == "local": # Тип работы изменяется в .env (cloud - использование облачных серверов Telegram; local - использование Telegram Local Bot API)
     request = HTTPXRequest(api_url_base=BOT_API_URL)
 else:
     request = None
@@ -95,6 +112,15 @@ def format_size(size_bytes):
     gb = mb / 1024
     return f"{gb:.1f} GB"
 
+# Проверка работы MongoDB
+def check_mongodb_connection():
+    try:
+        client.admin.command('ping')
+        return True
+    except Exception as e:
+        log(f"Ошибка подключения к MongoDB: {e}")
+        return False
+
 # Экранирует спецсимволы для Markdown-разметки.
 def escape_md(text):
     return text.replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[").replace("]", "\\]")
@@ -125,45 +151,25 @@ def save_json(file_path, obj):
 
 # Загружает список пользователей из файла.
 def load_users():
-    users = load_json(USERS_FILE, [])
-    changed = False
-    for u in users:
-        if "folders" not in u:
-            u["folders"] = 0
-            changed = True
-        if "created_at" not in u:
-            u["created_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            changed = True
-    if changed:
-        save_users(users)
-    return users
+    return list(users_collection.find())
 
 # Сохраняет список пользователей в файл.
 def save_users(users):
-    save_json(USERS_FILE, users)
+    users_collection.delete_many({})
+    if users:
+        users_collection.insert_many(users)
 
 # Проверяет, существует ли пользователь с данным ID.
 def user_exists(user_id: int) -> bool:
-    return any(u.get("id") == user_id for u in load_users())
+    return users_collection.count_documents({"id": user_id}) > 0
 
 # Получает объект пользователя по ID.
 def get_user(user_id: int):
-    return next((u for u in load_users() if u.get("id") == user_id), None)
-
-# Проверяет пароль пользователя.
-def check_password(user_id: int, password: str) -> bool:
-    user = get_user(user_id)
-    return user and password == user.get("password")
-
-# Возвращает статус пользователя (admin, default, banned).
-def get_status(user_id: int) -> str:
-    user = get_user(user_id)
-    return user.get("status", "default") if user else "default"
+    return users_collection.find_one({"id": user_id})
 
 # Добавляет нового пользователя.
 def add_user(user_id: int, password: str, status: str = "default", username: str = ""):
-    users = load_users()
-    users.append({
+    user_data = {
         "id": user_id,
         "password": password,
         "status": status,
@@ -175,8 +181,18 @@ def add_user(user_id: int, password: str, status: str = "default", username: str
         "rename": True,
         "delete": True,
         "folders_limit": 10
-    })
-    save_users(users)
+    }
+    users_collection.insert_one(user_data)
+
+# Проверяет пароль пользователя.
+def check_password(user_id: int, password: str) -> bool:
+    user = get_user(user_id)
+    return user and password == user.get("password")
+
+# Возвращает статус пользователя (admin, default, banned).
+def get_status(user_id: int) -> str:
+    user = get_user(user_id)
+    return user.get("status", "default") if user else "default"
 
 # Проверяет, авторизован ли пользователь.
 def is_authorized(user_id: int) -> bool:
@@ -185,12 +201,10 @@ def is_authorized(user_id: int) -> bool:
 
 # Устанавливает флаг авторизации для пользователя.
 def set_authorized(user_id: int, authorized: bool = True):
-    users = load_users()
-    for u in users:
-        if u.get("id") == user_id:
-            u["authorized"] = authorized
-            break
-    save_users(users)
+    users_collection.update_one(
+        {"id": user_id},
+        {"$set": {"authorized": authorized}}
+    )
 
 # Проверяет, является ли пользователь администратором.
 def is_admin(user_id: int) -> bool:
@@ -218,40 +232,31 @@ def sync_files_in_folder(folder):
 
 # Загружает список папок и синхронизирует их с файловой системой.
 def load_folders():
-    folders = load_json(FOLDERS_FILE, [])
-    changed = False
-    for folder in folders:
-        if 'id' not in folder:
-            folder['id'] = str(uuid.uuid4())
-            changed = True
-        folder = sync_files_in_folder(folder)
-    if changed:
-        save_folders(folders)
-    return folders
+    return list(folders_collection.find())
 
 # Сохраняет список папок.
 def save_folders(folders):
-    save_json(FOLDERS_FILE, folders)
+    folders_collection.delete_many({})
+    if folders:
+        folders_collection.insert_many(folders)
 
 # Получает папку по имени.
 def get_folder_by_name(name):
-    folders = load_folders()
-    for folder in folders:
-        if folder["name"] == name:
-            return sync_files_in_folder(folder)
+    folder = folders_collection.find_one({"name": name})
+    if folder:
+        return sync_files_in_folder(folder)
     return None
 
 # Получает папку по её ID.
 def get_folder_by_id(folder_id):
-    folders = load_folders()
-    for folder in folders:
-        if folder["id"] == folder_id:
-            return sync_files_in_folder(folder)
+    folder = folders_collection.find_one({"id": folder_id})
+    if folder:
+        return sync_files_in_folder(folder)
     return None
 
 # Проверяет существование папки по имени.
 def folder_exists(name):
-    return get_folder_by_name(name) is not None
+    return folders_collection.count_documents({"name": name}) > 0
 
 # Проверяет существование папки по ID.
 def folder_exists_by_id(folder_id):
@@ -259,18 +264,21 @@ def folder_exists_by_id(folder_id):
 
 # Добавляет новую папку.
 def add_folder(name, owner_id, status="public"):
-    folders = load_folders()
-    folders.append({"id": str(uuid.uuid4()), "name": name, "owner_id": owner_id, "status": status, "files": []})
-    save_folders(folders)
+    folder_data = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "owner_id": owner_id,
+        "status": status,
+        "files": []
+    }
+    folders_collection.insert_one(folder_data)
 
 # Меняет статус папки (private/public) по ID.
 def set_folder_status_by_id(folder_id, status):
-    folders = load_folders()
-    for folder in folders:
-        if folder["id"] == folder_id:
-            folder["status"] = status
-            break
-    save_folders(folders)
+    folders_collection.update_one(
+        {"id": folder_id},
+        {"$set": {"status": status}}
+    )
 
 # Устанавливает или снимает "заморозку" папки.
 def set_folder_freezing_by_id(folder_id, freezing: bool):
@@ -313,17 +321,14 @@ def rename_folder_fs(old_name, new_name):
 
 # Удаляет папку из базы по ID.
 def delete_folder_in_db_by_id(folder_id):
-    folders = [f for f in load_folders() if f["id"] != folder_id]
-    save_folders(folders)
+    folders_collection.delete_one({"id": folder_id})
 
 # Переименовывает папку в базе по ID.
 def rename_folder_in_db_by_id(folder_id, new_name):
-    folders = load_folders()
-    for folder in folders:
-        if folder["id"] == folder_id:
-            folder["name"] = new_name
-            break
-    save_folders(folders)
+    folders_collection.update_one(
+        {"id": folder_id},
+        {"$set": {"name": new_name}}
+    )
 
 # Формирует список папок для вывода пользователю.
 def get_folders_for_list():
@@ -2221,6 +2226,11 @@ async def ignore_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if LOG_ENABLED:
         log("Bot starting...")
+    
+    if not check_mongodb_connection():
+        log("Ошибка подключения к MongoDB. Бот не может быть запущен.")
+        return
+
     os.makedirs(DATABASE_DIR, exist_ok=True)
 
     main_conv = ConversationHandler(
