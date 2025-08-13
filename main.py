@@ -53,7 +53,7 @@ except Exception as e:
     print(f"Ошибка подключения к MongoDB: {e}")
     sys.exit(1)
 
-if BOT_API_MODE == "local": # Тип работы изменяется в .env (cloud - использование облачных серверов Telegram; local - использование Telegram Local Bot API)
+if BOT_API_MODE == "local":
     request = HTTPXRequest(api_url_base=BOT_API_URL)
 else:
     request = None
