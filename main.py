@@ -10,6 +10,7 @@ import warnings
 from enum import Enum, auto
 import urllib.parse
 from dotenv import load_dotenv
+from telegram.request import HTTPXRequest
 from telegram import (
     Update, ReplyKeyboardMarkup, InlineKeyboardMarkup,
     KeyboardButton, InlineKeyboardButton, ReplyKeyboardRemove
@@ -36,7 +37,6 @@ BOT_API_MODE = os.getenv("TELEGRAM_BOT_API_MODE", "cloud").lower()
 BOT_API_URL = os.getenv("TELEGRAM_BOT_API_URL")
 
 if BOT_API_MODE == "local":
-    from telegram.request import HTTPXRequest
     request = HTTPXRequest(api_url_base=BOT_API_URL)
 else:
     request = None
