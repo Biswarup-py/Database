@@ -874,11 +874,10 @@ def build_folder_manage_keyboard(folder_id: str, page: int, user_id=None):
         [add_btn, rename_btn],
         [files_btn],
     ]
+    buttons.append([delete_btn, logging_btn])
     if admin:
         freeze_btn = InlineKeyboardButton("🔥 Разморозить" if freezing else "❄️ Заморозить",callback_data=f"{'folder_unfreeze' if freezing else 'folder_freeze'}:{folder_id}:{page}")
         buttons.append([freeze_btn])
-    buttons.append([logging_btn])
-    buttons.append([delete_btn])
     buttons.append([back_btn])
 
     if freezing and not admin:
@@ -945,7 +944,7 @@ def build_file_manage_keyboard(folder_id, file_id, page):
     buttons = [
         [InlineKeyboardButton("✏️ Изменить имя", callback_data=f"file_rename:{file_id}:{page}"),
          InlineKeyboardButton("🗑 Удалить файл", callback_data=f"file_delete_confirm:{file_id}:{page}")],
-        [InlineKeyboardButton("📥 Получить файл", callback_data=f"file_get:{file_id}:{page}")],
+        [InlineKeyboardButton("📥 Скачать файл", callback_data=f"file_get:{file_id}:{page}")],
         [InlineKeyboardButton("🔙 Назад к списку файлов", callback_data=f"back_to_file_list:{page}")]
     ]
     return info_text, InlineKeyboardMarkup(buttons)
@@ -985,6 +984,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📑 Загрузка любых типов файлов\n"
         "✏️ Настройка файлов внутри бота\n"
         "🔒 Ограничение доступка к папкам\n"
+        "📝 Система логирования\n"
         "⚙️ Умное управление пользователями\n"
         "🦾 Хранение данных в MongoDB\n"
         "🤖 Доступно Local Bot API\n\n"
