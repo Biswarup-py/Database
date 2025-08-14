@@ -87,7 +87,7 @@ pip install -r requirements.txt
 TELEGRAM_BOT_TOKEN=ТОКЕН_БОТА
 TELEGRAM_BOT_API_MODE=cloud_или_local
 TELEGRAM_BOT_API_URL=ССЫЛКА_НА_СЕРВЕР_LOCAL_BOT_API
-MONGO_URI=ССЫЛКА_НА_MONGODB
+MONGO_URI=mongodb://localhost:27017/
 DB_NAME=ИМЯ_БД
 ```
 
