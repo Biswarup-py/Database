@@ -524,10 +524,7 @@ def build_folder_logging_keyboard(folder_id, page, user_id):
     last_log = get_last_folder_log_time(folder_id)
     folder = get_folder_by_id(folder_id)
     folder_name = folder["name"] if folder else ""
-    log_status_btn = InlineKeyboardButton(
-        "✅ Логирование: Вкл" if enabled else "❌ Логирование: Выкл",
-        callback_data=f"folder_logging_toggle:{folder_id}:{page}"
-    )
+    log_status_btn = InlineKeyboardButton("✅ Логирование: Вкл" if enabled else "❌ Логирование: Выкл",callback_data=f"folder_logging_toggle:{folder_id}:{page}")
     download_btn = InlineKeyboardButton("👁 Смотреть логи", callback_data=f"folder_logging_download:{folder_id}:{page}")
     clear_btn = InlineKeyboardButton("🗑 Удалить логи", callback_data=f"folder_logging_clear:{folder_id}:{page}")
     back_btn = InlineKeyboardButton("🔙 Назад к управлению папкой", callback_data=f"folder_logging_back:{folder_id}:{page}")
