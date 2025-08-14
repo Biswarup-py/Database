@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import traceback
 import datetime
@@ -10,8 +11,7 @@ import warnings
 from enum import Enum, auto
 import urllib.parse
 from dotenv import load_dotenv
-import pymongo
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from bson import ObjectId
 from telegram.request import HTTPXRequest
 from telegram import (
@@ -33,6 +33,7 @@ USERS_FILE = os.path.join(BASE_DIR, "users.json")
 FOLDERS_PER_PAGE = 10
 FILES_PER_PAGE = 10
 USERS_PER_PAGE = 10
+FOLDER_LOGS_LIMIT = 100
 
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -155,10 +156,16 @@ def load_users():
 
 # Сохраняет список пользователей в файл.
 def save_users(users):
-    users_collection.delete_many({})
-    if users:
-        users_collection.insert_many(users)
-
+    if not users:
+        return
+    bulk_ops = []
+    for u in users:
+        if "id" in u:
+            bulk_ops.append(
+                UpdateOne({"id": u["id"]}, {"$set": u}, upsert=True)
+            )
+    if bulk_ops:
+        users_collection.bulk_write(bulk_ops)
 # Проверяет, существует ли пользователь с данным ID.
 def user_exists(user_id: int) -> bool:
     return users_collection.count_documents({"id": user_id}) > 0
@@ -240,9 +247,16 @@ def load_folders():
 
 # Сохраняет список папок.
 def save_folders(folders):
-    folders_collection.delete_many({})
-    if folders:
-        folders_collection.insert_many(folders)
+    if not folders:
+        return
+    bulk_ops = []
+    for f in folders:
+        if "id" in f:
+            bulk_ops.append(
+                UpdateOne({"id": f["id"]}, {"$set": f}, upsert=True)
+            )
+    if bulk_ops:
+        folders_collection.bulk_write(bulk_ops)
 
 # Получает папку по имени.
 def get_folder_by_name(name):
@@ -257,6 +271,10 @@ def get_folder_by_id(folder_id):
     if folder:
         return sync_files_in_folder(folder)
     return None
+
+# Получает список ID всех папок.
+def get_folders():
+    return list_folder_ids()
 
 # Проверяет существование папки по имени.
 def folder_exists(name):
@@ -273,7 +291,9 @@ def add_folder(name, owner_id, status="public"):
         "name": name,
         "owner_id": owner_id,
         "status": status,
-        "files": []
+        "files": [],
+        "logging": False,
+        "logs": []
     }
     folders_collection.insert_one(folder_data)
 
@@ -394,7 +414,7 @@ def sync_folders_with_filesystem():
     for fs_folder in folders_fs:
         if fs_folder not in folders_db_names:
             folders_db.append({"id": str(uuid.uuid4()), "name": fs_folder, "owner_id": None, "status": "public", "files": []})
-            log(f"Added new folder from FS: {fs_folder}")
+            log(f"Добавлена новая папка с диска: {fs_folder}")
             changed = True
     valid_folders = []
     for folder in folders_db:
@@ -416,10 +436,6 @@ def cleanup_nonexistent_folders():
             valid_folders.append(folder)
     save_folders(valid_folders)
 
-# Получает список ID всех папок.
-def get_folders():
-    return list_folder_ids()
-
 # Получает количество файлов и общий размер папки.
 def get_folder_stats_by_id(folder_id):
     folder = get_folder_by_id(folder_id)
@@ -438,13 +454,96 @@ def get_folder_stats_by_id(folder_id):
 def get_folder_created_date_by_id(folder_id):
     folder = get_folder_by_id(folder_id)
     if not folder:
-        return "---"
+        return "нет данных"
     folder_path = os.path.join(DATABASE_DIR, folder["name"])
     if os.path.exists(folder_path):
         stat = os.stat(folder_path)
         date = datetime.datetime.fromtimestamp(stat.st_ctime)
         return date.strftime("%d.%m.%y")
-    return "---"
+    return "нет данных"
+
+# Получает логи папки.
+def get_folder_logs(folder_id):
+    folder = get_folder_by_id(folder_id)
+    return folder.get("logs", []) if folder else []
+
+# Записывает логи папки.
+def add_folder_log(folder_id, user_id, username, log_text):
+    folders = load_folders()
+    for folder in folders:
+        if folder["id"] == folder_id:
+            now = datetime.datetime.now().strftime("%d.%m.%y, %H:%M")
+            log_entry = f"*[{now}]*: Пользователь {username} ({user_id}) {log_text}"
+            logs = folder.get("logs", [])
+            logs.append(log_entry)
+            if len(logs) > FOLDER_LOGS_LIMIT:
+                logs = logs[-FOLDER_LOGS_LIMIT:]
+            folder["logs"] = logs
+            break
+    save_folders(folders)
+
+# Отчищает логи папки.
+def clear_folder_logs(folder_id):
+    folders = load_folders()
+    for folder in folders:
+        if folder["id"] == folder_id:
+            folder["logs"] = []
+            break
+    save_folders(folders)
+
+# Устанавливает логирование для папки.
+def set_folder_logging(folder_id, enabled: bool):
+    folders = load_folders()
+    for folder in folders:
+        if folder["id"] == folder_id:
+            folder["logging"] = enabled
+            break
+    save_folders(folders)
+
+# Проверка на логирование.
+def is_folder_logging_enabled(folder_id):
+    folder = get_folder_by_id(folder_id)
+    return folder.get("logging", False) if folder else False
+
+# Получает дату последнего лога
+def get_last_folder_log_time(folder_id):
+    logs = get_folder_logs(folder_id)
+    if not logs:
+        return "нет логов"
+    last_log = logs[-1]
+    match = re.search(r"\[(\d{2}\.\d{2}\.\d{2}, \d{2}:\d{2})\]", last_log)
+    if match:
+        return match.group(1)
+    return "нет логов"
+
+# Клавиатура меню логирования папки.
+def build_folder_logging_keyboard(folder_id, page, user_id):
+    enabled = is_folder_logging_enabled(folder_id)
+    logs = get_folder_logs(folder_id)
+    logs_count = len(logs)
+    last_log = get_last_folder_log_time(folder_id)
+    folder = get_folder_by_id(folder_id)
+    folder_name = folder["name"] if folder else ""
+    log_status_btn = InlineKeyboardButton(
+        "✅ Логирование: Вкл" if enabled else "❌ Логирование: Выкл",
+        callback_data=f"folder_logging_toggle:{folder_id}:{page}"
+    )
+    download_btn = InlineKeyboardButton("👁 Смотреть логи", callback_data=f"folder_logging_download:{folder_id}:{page}")
+    clear_btn = InlineKeyboardButton("🗑 Удалить логи", callback_data=f"folder_logging_clear:{folder_id}:{page}")
+    back_btn = InlineKeyboardButton("🔙 Назад к управлению папкой", callback_data=f"folder_logging_back:{folder_id}:{page}")
+    kb = [
+        [log_status_btn],
+        [download_btn, clear_btn],
+        [back_btn]
+    ]
+    text = (
+        f"*📝 Управление логированием*\n\n"
+        f"```Информация\n"
+        f"📛 Имя папки: {escape_md(folder_name)}\n"
+        f"📄 Всего логов: {logs_count}\n"
+        f"🗓 Последний лог: {last_log}```"
+    )
+    return text, InlineKeyboardMarkup(kb)
 
 # Получает общую статистику по базе данных.
 def get_database_stats():
@@ -768,6 +867,7 @@ def build_folder_manage_keyboard(folder_id: str, page: int, user_id=None):
     add_btn = InlineKeyboardButton("📂 Добавить файлы", callback_data=f"folder_add_files:{folder_id}:{page}")
     rename_btn = InlineKeyboardButton("✏️ Изменить имя", callback_data=f"folder_rename:{folder_id}:{page}")
     files_btn = InlineKeyboardButton("📄 Список файлов", callback_data=f"folder_file_list:{folder_id}:{page}")
+    logging_btn = InlineKeyboardButton("📝 Логирование", callback_data=f"folder_logging:{folder_id}:{page}")
     delete_btn = InlineKeyboardButton("🗑 Удалить папку", callback_data=f"folder_delete_confirm:{folder_id}:{page}")
     back_btn = InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")
 
@@ -780,6 +880,7 @@ def build_folder_manage_keyboard(folder_id: str, page: int, user_id=None):
     if admin:
         freeze_btn = InlineKeyboardButton("🔥 Разморозить" if freezing else "❄️ Заморозить",callback_data=f"{'folder_unfreeze' if freezing else 'folder_freeze'}:{folder_id}:{page}")
         buttons.append([freeze_btn])
+    buttons.append([logging_btn])
     buttons.append([delete_btn])
     buttons.append([back_btn])
 
@@ -803,14 +904,18 @@ def build_file_manage_keyboard(folder_id, file_id, page):
     file_type = "📄 Тип файла: Документ"
     if file_exists:
         ext = os.path.splitext(file_meta["name"])[1].lower()
-        if ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]:
+        if ext == ".gif":
+            file_type = "🎞 Тип файла: GIF"
+        elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
             file_type = "🖼 Тип файла: Фото"
         elif ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
             file_type = "📹 Тип файла: Видео"
         else:
             mime, _ = mimetypes.guess_type(file_meta["name"])
             if mime:
-                if mime.startswith("image/"):
+                if mime == "image/gif":
+                    file_type = "🎞 Тип файла: GIF"
+                elif mime.startswith("image/"):
                     file_type = "🖼 Тип файла: Фото"
                 elif mime.startswith("video/"):
                     file_type = "📹 Тип файла: Видео"
@@ -877,22 +982,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_path = os.path.join(BASE_DIR, "start.jpg")
     caption = (
         "*👋 Добро пожаловать!*\n\n"
-        "🗄 *Приватный файловый менеджер, работающий прямо через Telegram*\n\n"
+        "🗄 *Приватный файловый менеджер*\n\n"
         "*1️⃣ Возможности:*\n"
         "✈️ Отправка файлов на сервер\n"
         "📑 Загрузка любых типов файлов\n"
         "✏️ Настройка файлов внутри бота\n"
         "🔒 Ограничение доступка к папкам\n"
-        "⚙️ Умное управление пользователями\n\n"
+        "⚙️ Умное управление пользователями\n"
+        "🦾 Хранение данных в MongoDB\n"
+        "🤖 Доступно Local Bot API\n\n"
         "*2️⃣ Принципы работы:*\n"
         "⚡ Все действия — простые и быстрые\n"
         "🛡 Безопасность ваших данных\n"
-        "✅ Только авторизованные пользователи\n"
-        "🤖 Доступно Local Bot API\n\n"
+        "✅ Только авторизованные пользователи\n\n"
         "*3️⃣ Ссылки:*\n"
         "💭 Автор проекта: [ibuzy](https://t.me/ibuzy)\n"
         "🔗 GitHub репозиторий: [Kol-Dayn](https://github.com/Kol-Dayn/Database)\n\n"
-        "`Этот проект распространяется на условиях лицензии Apache-2.0 license`\n\n"
+        "`Этот проект распространяется на условиях лицензии Apache-2.0 license.`\n\n"
         "*➡️ Для входа — воспользуйтесь кнопкой в меню*"
     )
     if os.path.exists(photo_path):
@@ -914,10 +1020,14 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text
     if check_password(user_id, password):
         set_authorized(user_id, True)
-        await update.message.reply_text("Успешный вход!", reply_markup=get_main_kb(user_id))
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await update.message.reply_text("*✅ Успешный вход!*\n\n_Сообщение с вашим паролем было удалено для повышения безопасности._",parse_mode="Markdown", reply_markup=get_main_kb(user_id))
         return ConversationHandler.END
     set_authorized(user_id, False)
-    await update.message.reply_text("Неверный пароль. Попробуйте снова.", reply_markup=get_guest_kb())
+    await update.message.reply_text("*❌ Неверный пароль.* Попробуйте снова.",parse_mode="Markdown", reply_markup=get_guest_kb())
     return ConversationHandler.END
 
 # Меню для неавторизованных пользователей.
@@ -1000,7 +1110,7 @@ async def create_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if folder_name == "🔙 Отмена":
-        await update.message.reply_text("Действие отменено.", reply_markup=get_main_kb(user_id))
+        await update.message.reply_text("_Действие отменено._",parse_mode="Markdown", reply_markup=get_main_kb(user_id))
         return ConversationHandler.END
     if not folder_name or any(c in folder_name for c in r'\/:*?"<>|.'):
         await update.message.reply_text("Недопустимое имя папки. Попробуйте другое.", reply_markup=get_cancel_kb())
@@ -1274,6 +1384,15 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             os.remove(file_path)
             folder["files"] = [f for f in folder["files"] if f["id"] != file_id]
             save_folders(load_folders())
+
+            if is_folder_logging_enabled(folder_id):
+                add_folder_log(
+                    folder_id,
+                    user_id,
+                    user.get("username", ""),
+                    f'удалил файл "{escape_md(file_meta["name"])}". (🗑)'
+                )
+
             success_text = f"*Файл* `{escape_md(file_meta['name'])}` *удален.*"
             back_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Назад к списку файлов", callback_data=f"back_to_file_list:{page}")]
@@ -1325,26 +1444,6 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer(f"Ошибка отправки файла: {str(e)}", show_alert=True)
         return ConversationStates.FILES_MENU
 
-    if data.startswith("folder_freeze:"):
-        folder_id, page = data.split(":")[1], int(data.split(":")[2])
-        if not is_admin(user_id):
-            await query.answer("Только администратор может замораживать папки.", show_alert=True)
-            return ConversationStates.CHOOSING_FOLDER
-        set_folder_freezing_by_id(folder_id, True)
-        text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-        return ConversationStates.CHOOSING_FOLDER
-
-    if data.startswith("folder_unfreeze:"):
-        folder_id, page = data.split(":")[1], int(data.split(":")[2])
-        if not is_admin(user_id):
-            await query.answer("Только администратор может разморозить папки.", show_alert=True)
-            return ConversationStates.CHOOSING_FOLDER
-        set_folder_freezing_by_id(folder_id, False)
-        text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-        return ConversationStates.CHOOSING_FOLDER
-
     if data.startswith("folder_priv:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
         owner_id = get_folder_owner_by_id(folder_id)
@@ -1355,6 +1454,15 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationStates.CHOOSING_FOLDER
         if owner_id == user_id or admin:
             set_folder_status_by_id(folder_id, "private")
+
+            if is_folder_logging_enabled(folder_id):
+                add_folder_log(
+                    folder_id,
+                    user_id,
+                    get_user(user_id).get("username", ""),
+                    f'сменил статус папки на Приватный. (🔒)'
+                )
+
             text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         else:
@@ -1371,10 +1479,57 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationStates.CHOOSING_FOLDER
         if owner_id == user_id or admin:
             set_folder_status_by_id(folder_id, "public")
+
+            if is_folder_logging_enabled(folder_id):
+                add_folder_log(
+                    folder_id,
+                    user_id,
+                    get_user(user_id).get("username", ""),
+                    f'сменил статус папки на Публичный. (🔓)'
+                )
+
             text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         else:
             await query.answer("Только владелец папки может изменять данный параметр.", show_alert=True)
+        return ConversationStates.CHOOSING_FOLDER
+
+    if data.startswith("folder_freeze:"):
+        folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        if not is_admin(user_id):
+            await query.answer("Только администратор может замораживать папки.", show_alert=True)
+            return ConversationStates.CHOOSING_FOLDER
+        set_folder_freezing_by_id(folder_id, True)
+
+        if is_folder_logging_enabled(folder_id):
+            add_folder_log(
+                folder_id,
+                user_id,
+                get_user(user_id).get("username", ""),
+                f'сменил тип папки на Заморожена. (❄️)'
+            )
+
+        text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return ConversationStates.CHOOSING_FOLDER
+
+    if data.startswith("folder_unfreeze:"):
+        folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        if not is_admin(user_id):
+            await query.answer("Только администратор может разморозить папки.", show_alert=True)
+            return ConversationStates.CHOOSING_FOLDER
+        set_folder_freezing_by_id(folder_id, False)
+
+        if is_folder_logging_enabled(folder_id):
+            add_folder_log(
+                folder_id,
+                user_id,
+                get_user(user_id).get("username", ""),
+                f'сменил тип папки на Обычная. (🔥)'
+            )
+
+        text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         return ConversationStates.CHOOSING_FOLDER
 
     if data.startswith("folder_add_files:"):
@@ -1399,7 +1554,7 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationStates.CHOOSING_FOLDER
         context.user_data["add_files"] = {"folder_id": folder_id, "page": page, "added": False}
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.chat.send_message(f"Отправьте файл(ы) для папки `{escape_md(folder['name'])}`:",parse_mode="Markdown", reply_markup=get_files_cancel_kb())
+        await query.message.chat.send_message(f"_Внимание! Бот автоматически конвертирует все изображения в формат .jpg. Чтобы сохранить исходный формат, отправляйте изображение как файл._\n\nОтправьте файл(ы) для папки `{escape_md(folder['name'])}`:",parse_mode="Markdown", reply_markup=get_files_cancel_kb())
         return ConversationStates.ADD_FILES
 
     if data.startswith("folder_rename:"):
@@ -1517,6 +1672,74 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(success_text, parse_mode="Markdown", reply_markup=back_kb)
         return ConversationStates.CHOOSING_FOLDER
 
+    if data.startswith("folder_logging"):
+        await folder_logging_callback(update, context)
+        return ConversationStates.CHOOSING_FOLDER
+
+async def folder_logging_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    parts = data.split(":")
+    action = parts[0]
+    folder_id = parts[1]
+    page = int(parts[2]) if len(parts) > 2 else 0
+    folder = get_folder_by_id(folder_id)
+    owner_id = get_folder_owner_by_id(folder_id)
+    admin = is_admin(user_id)
+    is_owner = (user_id == owner_id)
+
+    if action != "folder_logging" and not (is_owner or admin):
+        await query.answer("Только владелец папки может изменять данный параметр.", show_alert=True)
+        return
+
+    if action == "folder_logging":
+        if not (is_owner or admin):
+            await query.answer("Только владелец папки может изменять данный параметр.", show_alert=True)
+            return
+        text, keyboard = build_folder_logging_keyboard(folder_id, page, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return ConversationStates.CHOOSING_FOLDER
+
+    if action == "folder_logging_toggle":
+        enabled = is_folder_logging_enabled(folder_id)
+        set_folder_logging(folder_id, not enabled)
+        text, keyboard = build_folder_logging_keyboard(folder_id, page, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return ConversationStates.CHOOSING_FOLDER
+
+    if action == "folder_logging_download":
+        logs = get_folder_logs(folder_id)
+        folder = get_folder_by_id(folder_id)
+        folder_name = folder["name"] if folder else ""
+        if not logs:
+            await query.answer("Логов нет.", show_alert=True)
+            return
+        logs_numbered = [
+            f"{i+1}. {log}" for i, log in enumerate(logs[::-1])
+        ]
+        logs_text = "\n\n".join(logs_numbered)
+        msg = f"*👁 Последние 100 действий с папкой* `{escape_md(folder_name)}`\n\n{logs_text}"
+        await query.message.reply_text(msg, parse_mode="Markdown")
+        await query.answer()
+        return
+
+    if action == "folder_logging_clear":
+        logs = get_folder_logs(folder_id)
+        if not logs:
+            await query.answer("Логов нет.", show_alert=True)
+            return
+        clear_folder_logs(folder_id)
+        await query.answer("Логи удалены.", show_alert=True)
+        text, keyboard = build_folder_logging_keyboard(folder_id, page, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return ConversationStates.CHOOSING_FOLDER
+
+    if action == "folder_logging_back":
+        text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return ConversationStates.CHOOSING_FOLDER
+
 # Добавление файлов в папку.
 async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1565,7 +1788,7 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if update.message.text in ("🔙 Отмена", "✅ Закончить добавление"):
-        await update.message.reply_text("Действие отменено." if update.message.text == "🔙 Отмена" else "Файл(ы) были добавлены в папку.",reply_markup=get_main_kb(user_id))
+        await update.message.reply_text("_Действие отменено._" if update.message.text == "🔙 Отмена" else "Файл(ы) были добавлены в папку.",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
         text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
         context.user_data.pop("add_files", None)
@@ -1574,22 +1797,49 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_items = []
     ext = None
     file_obj = None
-    if update.message.document:
-        file_obj = update.message.document
-        ext = None
+
+    if getattr(update.message, "animation", None):
+        file_obj = update.message.animation
+        ext = ".gif"
         file_items.append((file_obj, ext))
-    elif update.message.photo:
+    elif getattr(update.message, "document", None):
+        file_obj = update.message.document
+
+        if file_obj.mime_type == "image/gif" or (file_obj.file_name and file_obj.file_name.lower().endswith(".gif")):
+            ext = ".gif"
+        else:
+            ext = None
+        file_items.append((file_obj, ext))
+
+    elif getattr(update.message, "photo", None):
         file_obj = update.message.photo[-1]
         ext = ".jpg"
         file_items.append((file_obj, ext))
-    elif update.message.audio:
+
+    elif getattr(update.message, "audio", None):
         file_obj = update.message.audio
         ext = None
         file_items.append((file_obj, ext))
-    elif update.message.video:
-        file_obj = update.message.video
-        ext = ".mp4"
-        file_items.append((file_obj, ext))
+    elif getattr(update.message, "video", None):
+
+        if getattr(update.message, "video_note", None):
+            file_obj = None
+            ext = None
+        else:
+            file_obj = update.message.video
+            ext = ".mp4"
+            file_items.append((file_obj, ext))
+    elif getattr(update.message, "video_note", None):
+
+        file_obj = None
+        ext = None
+    elif getattr(update.message, "voice", None):
+        file_obj = None
+        ext = None
+
+    elif getattr(update.message, "sticker", None):
+        file_obj = None
+        ext = None
 
     if not file_items:
         show_finish = context.user_data["add_files"].get("added", False)
@@ -1602,8 +1852,20 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for file_obj, ext in file_items:
         file_name = getattr(file_obj, "file_name", None)
         if not file_name:
-            extension = ext if ext else ""
-            file_name = f"{type(file_obj).__name__}_{file_obj.file_id}{extension}"
+            if ext == ".gif":
+                file_name = f"animation_{file_obj.file_id}.gif"
+            else:
+                extension = ext if ext else ""
+                file_name = f"{type(file_obj).__name__}_{file_obj.file_id}{extension}"
+        else:
+            if ext == ".gif":
+                if not file_name.lower().endswith(".gif"):
+                    file_name = os.path.splitext(file_name)[0] + ".gif"
+                else:
+                    file_name = file_name
+            elif ext and not file_name.lower().endswith(ext):
+                file_name = os.path.splitext(file_name)[0] + ext
+
         save_path = os.path.join(folder_path, file_name)
         if file_name in existing_files or file_name in processed_file_names:
             duplicate_files.add(file_name)
@@ -1621,6 +1883,14 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f["files"].append({"id": str(uuid.uuid4()), "name": file_name})
                     break
             save_folders(folders)
+
+            if is_folder_logging_enabled(folder_id):
+                add_folder_log(
+                    folder_id,
+                    user_id,
+                    user.get("username", ""),
+                    f'добавил файл "{escape_md(file_name)}". (➕)'
+                )
 
         except telegram.error.BadRequest as e:
             if "File is too big" in str(e):
@@ -1644,7 +1914,11 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if too_big_files:
         reply_messages.append(f"*❌ Файл не добавлен*\n\nОтправленный файл слишком большой (макс 50 MB).")
 
-    await update.message.reply_text("\n\n".join(reply_messages),parse_mode="Markdown",reply_markup=get_files_finish_kb() if show_finish else get_files_cancel_kb())
+    await update.message.reply_text(
+        "\n\n".join(reply_messages),
+        parse_mode="Markdown",
+        reply_markup=get_files_finish_kb() if show_finish else get_files_cancel_kb()
+    )
     return ConversationStates.ADD_FILES
 
 # Переименование папки.
@@ -1695,7 +1969,7 @@ async def rename_folder_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationStates.CHOOSING_FOLDER
 
     if text == "🔙 Отмена":
-        await update.message.reply_text(f"Действие отменено.", reply_markup=get_main_kb(user_id))
+        await update.message.reply_text(f"_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
         text_reply, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
         await update.message.reply_text(text_reply, parse_mode="Markdown", reply_markup=keyboard)
         context.user_data.pop("rename_folder", None)
@@ -1710,7 +1984,17 @@ async def rename_folder_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(msg, reply_markup=get_cancel_kb())
         return ConversationStates.RENAME_FOLDER_NAME
 
+    old_name = folder["name"]
     rename_folder_in_db_by_id(folder_id, text)
+
+    if is_folder_logging_enabled(folder_id):
+        add_folder_log(
+            folder_id,
+            user_id,
+            user.get("username", ""),
+            f'переименовал папку "{escape_md(old_name)}" на "{escape_md(text)}". (✏️)'
+        )
+
     await update.message.reply_text(f"*Имя папки было сменено на* `{escape_md(text)}`*.*", parse_mode="Markdown", reply_markup=get_main_kb(user_id))
     text_reply, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
     await update.message.reply_text(text_reply, parse_mode="Markdown", reply_markup=keyboard)
@@ -1777,7 +2061,7 @@ async def rename_file_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old_ext = os.path.splitext(old_name)[1]
 
     if text == "🔙 Отмена":
-        await update.message.reply_text(f"Действие отменено.", reply_markup=get_main_kb(user_id))
+        await update.message.reply_text(f"_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
         info_text, keyboard = build_file_manage_keyboard(folder_id, file_id, page)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=keyboard)
         context.user_data.pop("rename_file", None)
@@ -1805,6 +2089,15 @@ async def rename_file_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_folders(folders)
         folder = next((f for f in folders if f["id"] == folder_id), None)
         file_meta = next((f for f in folder["files"] if f["id"] == file_id), None)
+
+        if is_folder_logging_enabled(folder_id):
+            add_folder_log(
+                folder_id,
+                user_id,
+                user.get("username", ""),
+                f'переименовал файл "{escape_md(old_name)}" на "{escape_md(text)}". (✏️)'
+            )
+
         await update.message.reply_text(f"*Имя файла было сменено на* `{escape_md(text)}`*.*",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
         info_text, keyboard = build_file_manage_keyboard(folder_id, file_id, page)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=keyboard)
@@ -1831,7 +2124,7 @@ async def my_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.delete()
         except Exception:
             pass
-        await query.message.chat.send_message("Вы вышли из аккаунта. Войдите через кнопку ниже.", reply_markup=get_guest_kb())
+        await query.message.chat.send_message("Вы *завершили* сессию. Снова войти в аккаунт можно по кнопке ниже.",parse_mode="Markdown", reply_markup=get_guest_kb())
         return ConversationHandler.END
 
     elif data == "my_account_logout_cancel":
@@ -2021,7 +2314,7 @@ async def user_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         user_id_to_cancel = int(data.split(":")[1])
         user = get_user(user_id_to_cancel)
         page = context.user_data.get('users_page', 0)
-        await query.message.chat.send_message("Действие отменено.", reply_markup=get_main_kb(update.effective_user.id))
+        await query.message.chat.send_message("_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(update.effective_user.id))
         await query.message.chat.send_message(build_user_manage_text(user),reply_markup=build_user_manage_keyboard(user, page),parse_mode="Markdown")
         return ConversationStates.USER_MANAGE_USER
 
@@ -2125,7 +2418,7 @@ async def user_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
     if text == "🔙 Отмена":
-        await update.message.reply_text("Действие отменено.", reply_markup=get_main_kb(user_id))
+        await update.message.reply_text("_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
         limit_user_id = context.user_data.pop("set_limit_user", None)
         user = get_user(limit_user_id)
         page = context.user_data.get('users_page', 0)
@@ -2157,7 +2450,7 @@ async def user_add_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_state(update, context, "user_add_id")
     text = update.message.text.strip()
     if text == "🔙 Отмена":
-        await update.message.reply_text("Действие отменено.",reply_markup=get_main_kb(update.effective_user.id))
+        await update.message.reply_text("_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(update.effective_user.id))
         users = load_users()
         await update.message.reply_text(build_users_list_message(users),reply_markup=build_users_list_keyboard(users, update.effective_user.id),parse_mode="Markdown")
         return ConversationStates.USER_MANAGE_MENU
@@ -2183,7 +2476,7 @@ async def user_add_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_state(update, context, "user_add_pass")
     password = update.message.text.strip()
     if password == "🔙 Отмена":
-        await update.message.reply_text("Действие отменено.", reply_markup=get_main_kb(update.effective_user.id))
+        await update.message.reply_text("_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(update.effective_user.id))
         if "change_pass_user" in context.user_data:
             user_id = context.user_data.pop("change_pass_user")
             user = get_user(user_id)
@@ -2226,7 +2519,7 @@ async def user_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_state(update, context, "user_add_name")
     username = update.message.text.strip()
     if username == "🔙 Отмена":
-        await update.message.reply_text("Действие отменено.", reply_markup=get_main_kb(update.effective_user.id))
+        await update.message.reply_text("_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(update.effective_user.id))
         users = load_users()
         page = 0
         total_pages = max(1, (len([u for u in users if u.get('id') != update.effective_user.id]) + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
@@ -2259,7 +2552,7 @@ async def user_send_msg_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if await precheck_reply(update, context): return ConversationHandler.END
     log_state(update, context, "user_send_msg_text")
     if update.message.text == "🔙 Отмена":
-        await update.message.reply_text("Действие отменено.", reply_markup=get_main_kb(update.effective_user.id))
+        await update.message.reply_text("_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(update.effective_user.id))
         user_id = context.user_data.get("send_msg_user")
         user = get_user(user_id)
         await update.message.reply_text(build_user_manage_text(user),reply_markup=build_user_manage_keyboard(user),parse_mode="Markdown")
@@ -2276,7 +2569,7 @@ async def cancel_confirm_send_msg(update: Update, context: ContextTypes.DEFAULT_
     if await precheck_reply(update, context): return ConversationHandler.END
     log_state(update, context, "cancel_confirm_send_msg")
     user_id = update.effective_user.id
-    await update.message.reply_text("Действие отменено.", reply_markup=get_main_kb(user_id))
+    await update.message.reply_text("_Действие отменено._",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
     managed_user_id = context.user_data.get("send_msg_user")
     user = get_user(managed_user_id)
     if user:
@@ -2350,7 +2643,7 @@ def main():
             ],
             ConversationStates.ADD_FILES: [
                 MessageHandler(
-                    filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO | (filters.TEXT & ~filters.COMMAND),
+                    filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.ANIMATION | filters.VOICE | filters.VIDEO_NOTE | (filters.TEXT & ~filters.COMMAND) | filters.Sticker.ALL,
                     add_files
                 )
             ],
