@@ -85,11 +85,18 @@ pip install -r requirements.txt
   
 ```
 TELEGRAM_BOT_TOKEN=ТОКЕН_БОТА
-TELEGRAM_BOT_API_MODE=cloud (cloud - использование облачных серверов Telegram; local - использование Telegram Local Bot API)
+TELEGRAM_BOT_API_MODE=cloud_или_local
 TELEGRAM_BOT_API_URL=ССЫЛКА_НА_СЕРВЕР_LOCAL_BOT_API
 MONGO_URI=ССЫЛКА_НА_MONGODB
 DB_NAME=ИМЯ_БД
 ```
+
+*Что выбрать в строке TELEGRAM_BOT_API_MODE?
+cloud - использование облачных серверов Telegram (Лимит на загрузку до 2 ГБ)
+local - использование Telegram Local Bot API (Лимит на загрузку до 50 МБ)*
+
+*Если используете cloud, строку TELEGRAM_BOT_API_URL можно оставить пустой.*
+<hr>
 
 <hr>
 
