@@ -224,21 +224,56 @@ def sync_files_in_folder(folder):
     if not os.path.exists(folder_path):
         folder["files"] = []
         return folder
+
     fs_files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
     files_meta = folder.get("files", [])
-    unique_files = {}
-    for f in files_meta:
-        if f["name"] in fs_files and f["name"] not in unique_files:
-            unique_files[f["name"]] = f
-    files_meta = list(unique_files.values())
-    fs_names_set = set(f["name"] for f in files_meta)
+
+    meta_by_name = {}
+    meta_lost = []
+    for meta in files_meta:
+        fpath = os.path.join(folder_path, meta["name"])
+        if os.path.exists(fpath):
+            stat = os.stat(fpath)
+            meta["size"] = stat.st_size
+            meta["ctime"] = stat.st_ctime
+            meta_by_name[meta["name"]] = meta
+        else:
+            meta_lost.append(meta)
+
+    matched_names = set(meta_by_name)
+    new_filemetas = []
+    used_lost = set()
+
     for fname in fs_files:
-        if fname not in fs_names_set:
-            files_meta.append({
+        if fname in meta_by_name:
+            new_filemetas.append(meta_by_name[fname])
+            continue
+
+        fpath = os.path.join(folder_path, fname)
+        stat = os.stat(fpath)
+        fsize = stat.st_size
+        fctime = stat.st_ctime
+
+        found = False
+        for idx, lost in enumerate(meta_lost):
+            if "size" in lost and "ctime" in lost:
+                if abs(lost["size"] - fsize) < 2 or abs(lost["ctime"] - fctime) < 2:
+                    lost["name"] = fname
+                    lost["size"] = fsize
+                    lost["ctime"] = fctime
+                    new_filemetas.append(lost)
+                    used_lost.add(idx)
+                    found = True
+                    break
+        if not found:
+            new_filemetas.append({
                 "id": str(uuid.uuid4()),
-                "name": fname
+                "name": fname,
+                "size": fsize,
+                "ctime": fctime
             })
-    folder["files"] = files_meta
+
+    folder["files"] = new_filemetas
     return folder
 
 # Загружает список папок и синхронизирует их с файловой системой.
@@ -429,11 +464,17 @@ def sync_folders_with_filesystem():
 def cleanup_nonexistent_folders():
     folders = load_folders()
     valid_folders = []
+    valid_names = set()
     for folder in folders:
         folder_path = os.path.join(DATABASE_DIR, folder["name"])
         if os.path.isdir(folder_path):
             folder = sync_files_in_folder(folder)
             valid_folders.append(folder)
+            valid_names.add(folder["name"])
+    all_db_names = set(f["name"] for f in folders)
+    to_remove = all_db_names - valid_names
+    if to_remove:
+        folders_collection.delete_many({"name": {"$in": list(to_remove)}})
     save_folders(valid_folders)
 
 # Получает количество файлов и общий размер папки.
@@ -549,6 +590,8 @@ def get_database_stats():
     total_size = 0
     for folder in folders:
         folder_path = os.path.join(DATABASE_DIR, folder["name"])
+        if not os.path.exists(folder_path):
+            continue
         files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
         total_files += len(files)
         total_size += sum(os.path.getsize(os.path.join(folder_path, f)) for f in files)
@@ -906,6 +949,8 @@ def build_file_manage_keyboard(folder_id, file_id, page):
             file_type = "🖼 Тип файла: Фото"
         elif ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
             file_type = "📹 Тип файла: Видео"
+        elif ext in [".zip", ".rar", ".7z", ".tar", ".gz", ".iso", "arj"]:
+            file_type = "📚 Тип файла: Архив"
         else:
             mime, _ = mimetypes.guess_type(file_meta["name"])
             if mime:
@@ -915,6 +960,8 @@ def build_file_manage_keyboard(folder_id, file_id, page):
                     file_type = "🖼 Тип файла: Фото"
                 elif mime.startswith("video/"):
                     file_type = "📹 Тип файла: Видео"
+                elif mime.startswith("application/zip"):
+                    file_type = "📚 Тип файла: Архив"
     else:
         file_type = "📄 Тип файла: Документ"
 
@@ -1139,7 +1186,7 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     def check_folder_exists_or_back_by_id(folder_id, page, action_text=None):
         if not folder_exists_by_id(folder_id):
-            msg = action_text if action_text else f"Папка была удалена другим пользователем."
+            msg = action_text if action_text else f"Папка не найдена."
             return {
                 "reply": (msg, InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
@@ -1153,6 +1200,8 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("folders_page:"):
         page = int(data.split(":")[1])
+        sync_folders_with_filesystem()
+        cleanup_nonexistent_folders()
         folders = get_folders_for_list()
         total_pages = max(1, (len(folders) + FOLDERS_PER_PAGE - 1) // FOLDERS_PER_PAGE)
         page = max(0, min(page, total_pages - 1))
@@ -1173,9 +1222,9 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("folder_select:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
         folder = get_folder_by_id(folder_id)
-        if not folder:
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
             await query.edit_message_text(
-                "Папка была удалена другим пользователем.",
+                "Папка не найдена.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
@@ -1190,6 +1239,17 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
         context.user_data["current_folder_id"] = folder_id
         folder = get_folder_by_id(folder_id)
+        folder = sync_files_in_folder(folder)
+        files = sorted(folder["files"], key=lambda f: f["name"])
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         admin = is_admin(user_id)
         is_owner = user_id == get_folder_owner_by_id(folder_id)
         freezing = is_folder_frozen_by_id(folder_id)
@@ -1200,22 +1260,32 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         if status == "private" and not (admin or is_owner):
             await query.answer("Нет доступа к приватной папке.", show_alert=True)
             return ConversationStates.CHOOSING_FOLDER
-        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
-            await query.edit_message_text("Папка была удалена.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]]))
-            return ConversationStates.CHOOSING_FOLDER
         files = folder["files"]
         files = sorted(files, key=lambda f: f["name"])
         total_pages = max(1, (len(files) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
         page = max(0, min(page, total_pages - 1))
         page_files = files[page * FILES_PER_PAGE : (page + 1) * FILES_PER_PAGE]
         text = f"*📄 Список файлов в папке*"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=build_files_keyboard(folder_id, page, total_pages, page_files))
+        await query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=build_files_keyboard(folder_id, page, total_pages, page_files)
+        )
         return ConversationStates.FILES_MENU
 
     if data.startswith("files_page:"):
-        parts = data.split(":")
-        folder_id, page = parts[1], int(parts[2])
+        folder_id, page = data.split(":")[1], int(data.split(":")[2])
         folder = get_folder_by_id(folder_id)
+        folder = sync_files_in_folder(folder)
+        files = sorted(folder["files"], key=lambda f: f["name"])
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.FILES_MENU
         files = sorted(folder["files"], key=lambda f: f["name"])
         total_pages = max(1, (len(files) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
         page = max(0, min(page, total_pages - 1))
@@ -1231,6 +1301,16 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("back_to_folder:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         return ConversationStates.CHOOSING_FOLDER
@@ -1240,7 +1320,29 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         file_id, page = parts[1], int(parts[2])
         folder_id = context.user_data.get("current_folder_id")
         folder = get_folder_by_id(folder_id)
+        folder = sync_files_in_folder(folder)
         file_meta = next((f for f in folder["files"] if f["id"] == file_id), None)
+        if not file_meta:
+            await query.edit_message_text(
+                "Файл не найден.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку файлов", callback_data=f"back_to_file_list:{page}")]
+                ])
+            )
+            return ConversationStates.FILES_MENU
+
+        file_path = os.path.join(DATABASE_DIR, folder["name"], file_meta["name"])
+        if not os.path.exists(file_path):
+            await query.edit_message_text(
+                "Файл не найден.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку файлов", callback_data=f"back_to_file_list:{page}")]
+                ])
+            )
+            return ConversationStates.FILES_MENU
+
         admin = is_admin(user_id)
         is_owner = user_id == get_folder_owner_by_id(folder_id)
         freezing = is_folder_frozen_by_id(folder_id)
@@ -1251,9 +1353,7 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         if status == "private" and not (admin or is_owner):
             await query.answer("Нет доступа к приватной папке.", show_alert=True)
             return ConversationStates.FILES_MENU
-        if not file_meta:
-            await query.edit_message_text("Файл не найден.", parse_mode="Markdown")
-            return ConversationStates.FILES_MENU
+
         info_text, keyboard = build_file_manage_keyboard(folder_id, file_id, page)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=keyboard)
         return ConversationStates.FILES_MENU
@@ -1262,13 +1362,32 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         parts = data.split(":")
         page = int(parts[1])
         folder_id = context.user_data.get("current_folder_id")
+
+        context.user_data.pop("rename_file", None)
+        context.user_data.pop("add_files", None)
+
         folder = get_folder_by_id(folder_id)
+        if not folder:
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:0")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
+
+        folder = sync_files_in_folder(folder)
         files = sorted(folder["files"], key=lambda f: f["name"])
         total_pages = max(1, (len(files) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
         page = max(0, min(page, total_pages - 1))
         page_files = files[page * FILES_PER_PAGE : (page + 1) * FILES_PER_PAGE]
         text = f"*📄 Список файлов в папке*"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=build_files_keyboard(folder_id, page, total_pages, page_files))
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=build_files_keyboard(folder_id, page, total_pages, page_files)
+        )
         return ConversationStates.FILES_MENU
 
     if data.startswith("file_rename:"):
@@ -1296,6 +1415,14 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["rename_file"] = {"folder_id": folder_id, "file_id": file_id, "page": page}
         await query.edit_message_reply_markup(reply_markup=None)
         file_meta = next((f for f in folder["files"] if f["id"] == file_id), None)
+        file_path = os.path.join(DATABASE_DIR, folder["name"], file_meta["name"]) if file_meta else None
+        if not file_meta or not os.path.exists(file_path):
+            await query.edit_message_text(
+                "Файл не найден.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к списку файлов", callback_data=f"back_to_file_list:{page}")]])
+            )
+            return ConversationStates.FILES_MENU
         await query.message.chat.send_message(f"Введите новое имя для файла `{escape_md(file_meta['name'])}`:",parse_mode="Markdown", reply_markup=get_cancel_kb())
         return ConversationStates.FILE_RENAME
 
@@ -1323,6 +1450,14 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationStates.FILES_MENU
 
         file_meta = next((f for f in folder["files"] if f["id"] == file_id), None)
+        file_path = os.path.join(DATABASE_DIR, folder["name"], file_meta["name"]) if file_meta else None
+        if not file_meta or not os.path.exists(file_path):
+            await query.edit_message_text(
+                "Файл не найден.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к списку файлов", callback_data=f"back_to_file_list:{page}")]])
+            )
+            return ConversationStates.FILES_MENU
         confirm_text = (f"Вы действительно хотите удалить файл `{escape_md(file_meta['name'])}`? Это действие *необратимо*.")
         confirm_kb = InlineKeyboardMarkup([
             [
@@ -1430,7 +1565,11 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         file_meta = next((f for f in folder["files"] if f["id"] == file_id), None)
         file_path = os.path.join(DATABASE_DIR, folder["name"], file_meta["name"]) if file_meta else None
         if not file_meta or not os.path.exists(file_path):
-            await query.answer("Файл уже удален.", show_alert=True)
+            await query.edit_message_text(
+                "Файл не найден.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к списку файлов", callback_data=f"back_to_file_list:{page}")]])
+            )
             return ConversationStates.FILES_MENU
 
         try:
@@ -1443,6 +1582,16 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("folder_priv:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         owner_id = get_folder_owner_by_id(folder_id)
         admin = is_admin(user_id)
         frozen = is_folder_frozen_by_id(folder_id)
@@ -1468,6 +1617,16 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("folder_public:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         owner_id = get_folder_owner_by_id(folder_id)
         admin = is_admin(user_id)
         frozen = is_folder_frozen_by_id(folder_id)
@@ -1493,6 +1652,16 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("folder_freeze:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         if not is_admin(user_id):
             await query.answer("Только администратор может замораживать папки.", show_alert=True)
             return ConversationStates.CHOOSING_FOLDER
@@ -1510,8 +1679,19 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         return ConversationStates.CHOOSING_FOLDER
 
+
     if data.startswith("folder_unfreeze:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         if not is_admin(user_id):
             await query.answer("Только администратор может разморозить папки.", show_alert=True)
             return ConversationStates.CHOOSING_FOLDER
@@ -1532,6 +1712,15 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("folder_add_files:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
         folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         user = get_user(user_id)
         admin = is_admin(user_id)
         freezing = is_folder_frozen_by_id(folder_id)
@@ -1557,6 +1746,15 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("folder_rename:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
         folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         user = get_user(user_id)
         admin = is_admin(user_id)
         freezing = is_folder_frozen_by_id(folder_id)
@@ -1582,6 +1780,15 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("folder_delete_confirm:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
         folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         user = get_user(user_id)
         admin = is_admin(user_id)
         owner_id = get_folder_owner_by_id(folder_id)
@@ -1612,6 +1819,16 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("folder_delete_cancel:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
+        folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         text, keyboard = build_folder_manage_keyboard(folder_id, page, user_id)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         return ConversationStates.CHOOSING_FOLDER
@@ -1619,6 +1836,15 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("folder_delete:"):
         folder_id, page = data.split(":")[1], int(data.split(":")[2])
         folder = get_folder_by_id(folder_id)
+        if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+            await query.edit_message_text(
+                "Папка не найдена.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+                ])
+            )
+            return ConversationStates.CHOOSING_FOLDER
         user = get_user(user_id)
         admin = is_admin(user_id)
         owner_id = get_folder_owner_by_id(folder_id)
@@ -1673,6 +1899,7 @@ async def folder_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         await folder_logging_callback(update, context)
         return ConversationStates.CHOOSING_FOLDER
 
+# Обработка нажатий на Inline-кнопки для меню логгинга
 async def folder_logging_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -1681,7 +1908,18 @@ async def folder_logging_callback(update: Update, context: ContextTypes.DEFAULT_
     action = parts[0]
     folder_id = parts[1]
     page = int(parts[2]) if len(parts) > 2 else 0
+
     folder = get_folder_by_id(folder_id)
+    if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+        await query.edit_message_text(
+            "Папка не найдена.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад к списку папок", callback_data=f"folders_page:{page}")]
+            ])
+        )
+        return ConversationStates.CHOOSING_FOLDER
+
     owner_id = get_folder_owner_by_id(folder_id)
     admin = is_admin(user_id)
     is_owner = (user_id == owner_id)
@@ -1757,8 +1995,8 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     folder_id = data["folder_id"]
     page = data["page"]
     folder = get_folder_by_id(folder_id)
-    if not folder:
-        await update.message.reply_text("Папка была удалена другим пользователем.", reply_markup=get_main_kb(user_id))
+    if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+        await update.message.reply_text("Папка не найдена.", reply_markup=get_main_kb(user_id))
         context.user_data.pop("add_files", None)
         return ConversationHandler.END
 
@@ -1770,7 +2008,7 @@ async def add_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationStates.CHOOSING_FOLDER
 
     if not os.path.exists(folder_path):
-        await update.message.reply_text(f"Папка была удалена другим пользователем.",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
+        await update.message.reply_text(f"Папка не найдена.",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
         context.user_data.pop("add_files", None)
         return ConversationHandler.END
 
@@ -1939,6 +2177,10 @@ async def rename_folder_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     folder_id = data["folder_id"]
     page = data["page"]
     folder = get_folder_by_id(folder_id)
+    if not folder or not os.path.exists(os.path.join(DATABASE_DIR, folder["name"])):
+        await update.message.reply_text("Папка не найдена.",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
+        context.user_data.pop("rename_folder", None)
+        return ConversationHandler.END
 
     admin = is_admin(user_id)
     freezing = is_folder_frozen_by_id(folder_id)
@@ -1951,7 +2193,7 @@ async def rename_folder_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationStates.CHOOSING_FOLDER
 
     if not folder:
-        await update.message.reply_text("Папка была удалена другим пользователем.",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
+        await update.message.reply_text("Папка не найдена.",parse_mode="Markdown",reply_markup=get_main_kb(user_id))
         context.user_data.pop("rename_folder", None)
         return ConversationHandler.END
 
